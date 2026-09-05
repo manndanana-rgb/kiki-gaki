@@ -22,7 +22,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -45,7 +47,6 @@ class RecordingService : Service() {
     private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
 
     private lateinit var recordingsDir: File
-    private var currentFile: File? = null
 
     inner class LocalBinder : Binder() {
         val service: RecordingService get() = this@RecordingService
@@ -71,15 +72,14 @@ class RecordingService : Service() {
     }
 
     fun startRecording() {
-        if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) return
+        if (RecordingStateManager.state.value.isRecording) return
 
         val file = File(recordingsDir, "rec_${System.currentTimeMillis()}.wav")
-        currentFile = file
         wavWriter = WavWriter(file, sampleRate)
 
         val recorder = AudioRecord(
             MediaRecorder.AudioSource.MIC,
-            sampleRate, channelConfig, audioFormat, bufferSize
+            sampleRate, channelConfig, audioFormat, bufferSize * 2
         )
         audioRecord = recorder
         recorder.startRecording()
@@ -96,18 +96,21 @@ class RecordingService : Service() {
                     status = "recording"
                 )
             )
-            RecordingStateManager.update { it.copy(currentRecordingId = id, isRecording = true, isPaused = false, filePath = file.absolutePath) }
+            RecordingStateManager.update {
+                it.copy(currentRecordingId = id, isRecording = true, isPaused = false, elapsedMs = 0, filePath = file.absolutePath)
+            }
         }
 
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KikiGaki:recording").apply {
             setReferenceCounted(false)
-            acquire(60 * 60 * 1000L) // 1時間
+            acquire(60 * 60 * 1000L) // 1時間上限
         }
 
+        // 読み取りループ: 一時停止中(read<=0)は待機して再開後に自動復帰する
         recordJob = serviceScope.launch(Dispatchers.IO) {
             val buffer = ByteArray(bufferSize)
-            while (true) {
+            while (isActive) {
                 val read = recorder.read(buffer, 0, buffer.size)
                 if (read > 0) {
                     wavWriter?.write(buffer, 0, read)
@@ -118,71 +121,100 @@ class RecordingService : Service() {
                         if (a > peak) peak = a
                     }
                     RecordingStateManager.update { it.copy(peakAmplitude = peak) }
-                } else if (read < 0) break
+                } else {
+                    // 一時停止(stop)中または一時的エラー: 待機してリトライ
+                    delay(50)
+                }
             }
         }
 
         val startMs = SystemClock.elapsedRealtime()
         tickJob = serviceScope.launch {
-            while (true) {
+            while (isActive) {
                 delay(200)
-                RecordingStateManager.update {
-                    it.copy(elapsedMs = SystemClock.elapsedRealtime() - startMs)
-                }
+                val elapsed = SystemClock.elapsedRealtime() - startMs
+                RecordingStateManager.update { it.copy(elapsedMs = elapsed) }
+                updateNotification(elapsed)
             }
         }
     }
 
     fun pauseRecording() {
-        audioRecord?.stop()
+        if (!RecordingStateManager.state.value.isRecording) return
+        if (RecordingStateManager.state.value.isPaused) return
+        audioRecord?.stop() // read() は即座にエラーを返す → ループは delay(50) で待機
         tickJob?.cancel()
-        RecordingStateManager.update { it.copy(isPaused = true) }
+        tickJob = null
+        RecordingStateManager.update { it.copy(isPaused = true, peakAmplitude = 0) }
+        updateNotification(RecordingStateManager.state.value.elapsedMs, paused = true)
     }
 
     fun resumeRecording() {
+        val s = RecordingStateManager.state.value
+        if (!s.isRecording || !s.isPaused) return
         audioRecord?.startRecording()
-        val startMs = SystemClock.elapsedRealtime() - RecordingStateManager.state.value.elapsedMs
+        val startMs = SystemClock.elapsedRealtime() - s.elapsedMs
         tickJob = serviceScope.launch {
-            while (true) {
+            while (isActive) {
                 delay(200)
-                RecordingStateManager.update {
-                    it.copy(elapsedMs = SystemClock.elapsedRealtime() - startMs, isPaused = false)
-                }
+                val elapsed = SystemClock.elapsedRealtime() - startMs
+                RecordingStateManager.update { it.copy(elapsedMs = elapsed, isPaused = false) }
+                updateNotification(elapsed)
             }
         }
     }
 
     fun stopRecording() {
-        recordJob?.cancel()
+        val s = RecordingStateManager.state.value
+        if (!s.isRecording) return
+
         tickJob?.cancel()
+        tickJob = null
         audioRecord?.apply { stop(); release() }
         audioRecord = null
-        wavWriter?.close()
-        wavWriter = null
-        wakeLock?.release()
 
-        val id = RecordingStateManager.state.value.currentRecordingId
-        if (id != null) {
-            serviceScope.launch {
-                val dao = AppDatabase.get(this@RecordingService).recordingDao()
-                val r = dao.getById(id)
-                if (r != null) {
-                    dao.update(
-                        r.copy(
-                            durationMs = RecordingStateManager.state.value.elapsedMs,
-                            status = "processing"
-                        )
-                    )
-                }
-                RecordingStateManager.reset()
+        serviceScope.launch {
+            // 読み取りループの終了を待ってからWAVをクローズ(書き込み競合防止)
+            recordJob?.cancelAndJoin()
+            recordJob = null
+            withContext(Dispatchers.IO) {
+                wavWriter?.close()
+                wavWriter = null
             }
-        } else {
+            wakeLock?.let { if (it.isHeld) it.release() }
+            wakeLock = null
+
+            val id = s.currentRecordingId
+            if (id != null) {
+                val dao = AppDatabase.get(this@RecordingService).recordingDao()
+                dao.getById(id)?.let { r ->
+                    dao.update(r.copy(durationMs = s.elapsedMs, status = "processing"))
+                }
+            }
             RecordingStateManager.reset()
+            updateNotification(0, idle = true)
         }
     }
 
+    private fun updateNotification(elapsedMs: Long = 0, paused: Boolean = false, idle: Boolean = false) {
+        val text = when {
+            idle -> "停止中"
+            paused -> "一時停止中 ${formatTime(elapsedMs)}"
+            else -> "録音中 ${formatTime(elapsedMs)}"
+        }
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIF_ID, buildNotification(text))
+    }
+
+    private fun formatTime(ms: Long): String {
+        val totalSec = ms / 1000
+        val m = totalSec / 60
+        val s = totalSec % 60
+        return "%02d:%02d".format(m, s)
+    }
+
     private fun startForegroundCompat() {
-        val notif = buildNotification("録音準備中")
+        val notif = buildNotification("準備完了")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
@@ -210,7 +242,7 @@ class RecordingService : Service() {
         super.onDestroy()
         serviceScope.cancel()
         audioRecord?.release()
-        wakeLock?.release()
+        wakeLock?.let { if (it.isHeld) it.release() }
     }
 
     companion object {
