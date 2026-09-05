@@ -24,7 +24,9 @@
             </intent-filter>
         </activity>
 
-        <!-- Phase 1: 前台サービス(マイク録音)をここに追加 -->
-        <!-- <service android:name=".recording.RecordingService" android:foregroundServiceType="microphone" android:exported="false"/> -->
+        <service
+            android:name=".recording.RecordingService"
+            android:foregroundServiceType="microphone"
+            android:exported="false" />
     </application>
 </manifest>
