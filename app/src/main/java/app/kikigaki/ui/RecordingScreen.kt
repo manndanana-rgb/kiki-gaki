@@ -50,7 +50,12 @@ fun RecordingScreen(vm: RecordingViewModel = viewModel()) {
     val context = LocalContext.current
 
     val connection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {}
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val localBinder = binder as? RecordingService.LocalBinder
+            localBinder?.setPcmListener { pcm, offset, length ->
+                vm.onPcmFrame(pcm, offset, length)
+            }
+        }
         override fun onServiceDisconnected(name: ComponentName?) {}
     }
 

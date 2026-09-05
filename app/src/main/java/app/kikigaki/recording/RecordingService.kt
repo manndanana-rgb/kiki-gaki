@@ -41,6 +41,11 @@ class RecordingService : Service() {
     private var recordJob: Job? = null
     private var tickJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var pcmListener: ((ByteArray, Int, Int) -> Unit)? = null
+
+    fun setPcmListener(listener: ((ByteArray, Int, Int) -> Unit)?) {
+        pcmListener = listener
+    }
 
     private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
@@ -51,6 +56,8 @@ class RecordingService : Service() {
 
     inner class LocalBinder : Binder() {
         val service: RecordingService get() = this@RecordingService
+        fun setPcmListener(l: ((ByteArray, Int, Int) -> Unit)?) = service.setPcmListener(l)
+        fun getPcmListener(): ((ByteArray, Int, Int) -> Unit)? = service.pcmListener
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -115,6 +122,8 @@ class RecordingService : Service() {
                 val read = recorder.read(buffer, 0, buffer.size)
                 if (read > 0) {
                     wavWriter?.write(buffer, 0, read)
+                    // PCM リスナーにチャンクを渡す(ライブSTT用)
+                    pcmListener?.invoke(buffer, 0, read)
                     var peak = 0
                     for (i in 0 until read step 2) {
                         val v = (buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xff)
