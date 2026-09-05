@@ -3,6 +3,7 @@ package app.kikigaki.recording
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -192,7 +193,11 @@ class RecordingService : Service() {
                 }
             }
             RecordingStateManager.reset()
-            updateNotification(0, idle = true)
+            // 録音停止後は前台通知を消してサービスも終了(UIがバインド中は破棄されない)
+            mainExecutor.execute {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
         }
     }
 
@@ -230,11 +235,22 @@ class RecordingService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
+        val stopIntent = Intent(this, RecordingService::class.java).apply { action = "STOP" }
+        val stopPi = PendingIntent.getService(
+            this, 2, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val openIntent = packageManager.getLaunchIntentForPackage(packageName)
+        val openPi = openIntent?.let {
+            PendingIntent.getActivity(this, 3, it, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("ききがき")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
+            .apply { if (openPi != null) setContentIntent(openPi) }
+            .addAction(0, "停止", stopPi)
             .build()
     }
 

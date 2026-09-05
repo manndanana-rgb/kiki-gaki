@@ -1,11 +1,13 @@
 package app.kikigaki.ui
 
+import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.Build
 import android.os.IBinder
+import android.view.WindowManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -53,6 +55,10 @@ fun RecordingScreen(vm: RecordingViewModel = viewModel()) {
     }
 
     DisposableEffect(Unit) {
+        // 録音画面表示中は画面スリープを防ぐ(ライブテキストを見続けるため)
+        val activity = context as? Activity
+        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         val intent = Intent(context, RecordingService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
@@ -60,7 +66,10 @@ fun RecordingScreen(vm: RecordingViewModel = viewModel()) {
             context.startService(intent)
         }
         context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
-        onDispose { context.unbindService(connection) }
+        onDispose {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            context.unbindService(connection)
+        }
     }
 
     Scaffold { padding ->
