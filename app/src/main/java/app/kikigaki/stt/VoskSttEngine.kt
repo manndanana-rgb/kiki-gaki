@@ -6,13 +6,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.vosk.Model
 import org.vosk.Recognizer
-import org.vosk.android.RecognitionListener
-import org.vosk.android.SpeechStreamService
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 class VoskSttEngine(
     private val context: Context,
@@ -83,9 +79,16 @@ class VoskSttEngine(
 
     override fun feedChunk(pcm: ByteArray, offset: Int, length: Int) {
         val rec = recognizer ?: return
-        val buf = ByteBuffer.wrap(pcm, offset, length).order(ByteOrder.LITTLE_ENDIAN)
+        // PCM16 リトルエンディアン → short[] (vosk-android 0.3.x API)
+        val samples = length / 2
+        val shorts = ShortArray(samples)
+        for (i in 0 until samples) {
+            val lo = pcm[offset + i * 2].toInt() and 0xff
+            val hi = pcm[offset + i * 2 + 1].toInt()
+            shorts[i] = (hi shl 8 or lo).toShort()
+        }
         when {
-            rec.acceptWaveform(buf, length) -> {
+            rec.acceptWaveform(shorts, samples) -> {
                 val text = rec.result
                     .let { Regex("\"text\"\\s*:\\s*\"(.*?)\"").find(it)?.groupValues?.get(1) ?: "" }
                 if (text.isNotBlank()) listener?.onFinal(SttResult(text, true))
